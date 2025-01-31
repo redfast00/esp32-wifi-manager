@@ -165,7 +165,7 @@ config WIFI_POWER_DEFAULT
 
 config WIFI_DEFAULT_STA_CONNECT_RETRY_CNT
     int "STA Connect Retry Count"
-    default 5
+    default 0
     range 0 25
     help
         Number of times to retry to connect to an AP.
@@ -218,28 +218,28 @@ config WIFI_DEFAULT_STA_SORT_METHOD
 
 config WIFI_DEFAULT_STA_RM_ENABLED
     int "Default STA RM Enabled"
-    default 1
+    default 0
     range 0 1
     help
         Default STA RM Enabled. 0=disabled, 1=enabled
 
 config WIFI_DEFAULT_STA_BTM_ENABLED
     int "Default STA BTM Enabled"
-    default 1
+    default 0
     range 0 1
     help
         Default STA BTM Enabled. 0=disabled, 1=enabled
 
 config WIFI_DEFAULT_STA_MBO_ENABLED
     int "Default STA MBO Enabled"
-    default 1
+    default 0
     range 0 1
     help
         Default STA MBO Enabled. 0=disabled, 1=enabled
 
 config WIFI_DEFAULT_STA_FT_ENABLED
     int "Default STA FT Enabled"
-    default 1
+    default 0
     range 0 1
     help
         Default STA FT Enabled. 0=disabled, 1=enabled
