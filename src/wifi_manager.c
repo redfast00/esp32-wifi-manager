@@ -201,10 +201,10 @@ static void wifi_manager_event_handler(void *arg, esp_event_base_t event_base, i
 
 void reset_retry_timer(void)
 {
-	xTimerStop(wifi_manager_retry_timer, (TickType_t)0);
 	current_retry_interval = CONFIG_WIFI_MANAGER_INITIAL_RETRY_MS;
 	xTimerChangePeriod(wifi_manager_retry_timer, pdMS_TO_TICKS(current_retry_interval), 0);
 	ESP_LOGW(TAG, "resetting retry timer to %ld ms", current_retry_interval);
+	xTimerStop(wifi_manager_retry_timer, (TickType_t)0);
 }
 
 void decelerate_retry_timer(void)
@@ -1037,10 +1037,11 @@ static void wifi_manager_event_handler(void *arg, esp_event_base_t event_base, i
 			ESP_LOGD(TAG, "WIFI_EVENT_STA_CONNECTED");
 			/* this current connection attempt has ended in success */
 			xEventGroupClearBits(wifi_manager_event_group, WIFI_MANAGER_CONNECT_IN_PROGRESS);
+
 			/* Check whether this is the hardcoded AP. */
+#ifdef CONFIG_HARDCODED_SSID_ENABLE
 			wifi_config_t *config = wifi_manager_get_wifi_sta_config();
 
-#ifdef CONFIG_HARDCODED_SSID_ENABLE
 			if ((strcmp((char *)config->sta.ssid, HARDCODED_SSID) == 0) && (strcmp((char *)config->sta.password, HARDCODED_PASSWORD) == 0))
 			{
 				sta_connected_to_hardcoded = true;
@@ -2139,7 +2140,7 @@ char *wifi_manager_get_saved_aps_json(void)
 	esp_err_t esp_err;
 	ap_config_t saved_networks[CONFIG_WIFI_MAX_AP_CONFIGS] = {0};
 	size_t required_size = sizeof(saved_networks);
-	char json_string = NULL;
+	char *json_string = NULL;
 	// Lock NVS for thread-safe access
 	if (!nvs_sync_lock(portMAX_DELAY))
 	{
