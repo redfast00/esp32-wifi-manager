@@ -34,6 +34,7 @@ Contains the freeRTOS task for the DNS server that processes the requests.
 #include <lwip/sockets.h>
 #include <string.h>
 #include <stdint.h>
+#include <errno.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/event_groups.h>
@@ -56,7 +57,7 @@ Contains the freeRTOS task for the DNS server that processes the requests.
 
 static const char *TAG = "DNS_SERVER";
 static TaskHandle_t task_dns_server = NULL;
-static int socket_fd;
+static int socket_fd = -1;
 static SemaphoreHandle_t socket_in_use_mutex = NULL;
 
 void dns_server_start()
@@ -75,15 +76,25 @@ void dns_server_stop()
         /* If the task is deleted while recvfrom() is waiting, the socket
          * will remain in use and will be in zombie state forever. Close the
          * socket to cause recvfrom() to abort. */
-        close(socket_fd);
+        if (socket_fd >= 0)
+        {
+            close(socket_fd);
+            socket_fd = -1;
+        }
         /* Wait for recvfrom() to return, signified by the mutex being
          * released */
-        xSemaphoreTake(socket_in_use_mutex, pdMS_TO_TICKS(500));
+        if (socket_in_use_mutex != NULL)
+        {
+            xSemaphoreTake(socket_in_use_mutex, pdMS_TO_TICKS(500));
+        }
         /* Now it is safe to delete the task */
         vTaskDelete(task_dns_server);
         task_dns_server = NULL;
-        vSemaphoreDelete(socket_in_use_mutex);
-        socket_in_use_mutex = NULL;
+        if (socket_in_use_mutex != NULL)
+        {
+            vSemaphoreDelete(socket_in_use_mutex);
+            socket_in_use_mutex = NULL;
+        }
     }
 }
 
@@ -101,13 +112,14 @@ void dns_server(void *pvParameters)
     if (socket_fd < 0)
     {
         ESP_LOGE(TAG, "Failed to create socket");
-        exit(0);
+        vTaskDelete(NULL);
+        return;
     }
 
-    /* Bind to port 53 (typical DNS Server port) */
+    /* Bind to port 53 (typical DNS Server port) on AP interface */
     esp_netif_ip_info_t ip;
-    esp_netif_t *netif_sta = wifi_manager_get_esp_netif_sta();
-    ESP_ERROR_CHECK(esp_netif_get_ip_info(netif_sta, &ip));
+    esp_netif_t *netif_ap = wifi_manager_get_esp_netif_ap();
+    ESP_ERROR_CHECK(esp_netif_get_ip_info(netif_ap, &ip));
     ra.sin_family = AF_INET;
     ra.sin_addr.s_addr = ip.ip.addr;
     ra.sin_port = htons(53);
@@ -115,7 +127,9 @@ void dns_server(void *pvParameters)
     {
         ESP_LOGE(TAG, "Failed to bind to 53/udp");
         close(socket_fd);
-        exit(1);
+        socket_fd = -1;
+        vTaskDelete(NULL);
+        return;
     }
 
     struct sockaddr_in client;
@@ -136,14 +150,31 @@ void dns_server(void *pvParameters)
     for (;;)
     {
 
-        memset(data, 0x00, sizeof(data)); /* reset buffer */
+        if (socket_fd < 0)
+        {
+            ESP_LOGE(TAG, "Socket is invalid, exiting DNS server task");
+            break;
+        }
         xSemaphoreTake(socket_in_use_mutex, portMAX_DELAY);
         length = recvfrom(socket_fd, data, sizeof(data), 0, (struct sockaddr *)&client, &client_len); /* read udp request */
         xSemaphoreGive(socket_in_use_mutex);
+        
+        if (length <= 0)
+        {
+            /* Socket was closed or error occurred, exit the loop */
+            if (errno == EBADF || errno == ENOTSOCK)
+            {
+                ESP_LOGI(TAG, "Socket closed, exiting DNS server task");
+                break;
+            }
+            /* Continue on other errors (like EAGAIN) */
+            taskYIELD();
+            continue;
+        }
 
         /*if the query is bigger than the buffer size we simply ignore it. This case should only happen in case of multiple
          * queries within the same DNS packet and is not supported by this simple DNS hijack. */
-        if (length > 0 && ((length + sizeof(dns_answer_t) - 1) < DNS_ANSWER_MAX_SIZE))
+        if (length > 0 && ((length + sizeof(dns_answer_t)) <= DNS_ANSWER_MAX_SIZE))
         {
 
             data[length] = '\0'; /*in case there's a bogus domain name that isn't null terminated */

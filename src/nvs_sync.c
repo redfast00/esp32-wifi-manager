@@ -87,5 +87,8 @@ bool nvs_sync_lock(TickType_t xTicksToWait)
 
 void nvs_sync_unlock()
 {
-	xSemaphoreGive(nvs_sync_mutex);
+	if (nvs_sync_mutex != NULL)
+	{
+		xSemaphoreGive(nvs_sync_mutex);
+	}
 }

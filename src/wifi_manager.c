@@ -34,6 +34,7 @@ Contains the freeRTOS task and all necessary support
 #include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <limits.h>
 #include "esp_system.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -285,21 +286,29 @@ void wifi_manager_filter_unique(wifi_ap_record_t *aplist, uint16_t *aps)
 	qsort(aplist, unique_count, sizeof(wifi_ap_record_t), compare_rssi);
 
 	*aps = unique_count;
-	// print the list of APs
+	// Log filtered APs only in debug mode to reduce log spam
+	ESP_LOGD(TAG, "Filtered %d unique APs", unique_count);
+#if ESP_LOG_LEVEL >= ESP_LOG_DEBUG
 	for (uint16_t i = 0; i < *aps; i++)
 	{
-		ESP_LOGI(TAG, "Filtered AP: %s RSSI: %d BSSID: " MACSTR, aplist[i].ssid, aplist[i].rssi, MAC2STR(aplist[i].bssid));
+		ESP_LOGD(TAG, "Filtered AP: %s RSSI: %d BSSID: " MACSTR, aplist[i].ssid, aplist[i].rssi, MAC2STR(aplist[i].bssid));
 	}
+#endif
 }
 
 void append_mac_address(void)
 {
 	uint8_t mac_address[6];
-	if ((strlen((char *)wifi_settings.ap_ssid) + 6 < sizeof(wifi_settings.ap_ssid)) && (esp_read_mac(mac_address, ESP_MAC_WIFI_STA) == ESP_OK))
+	size_t current_len = strlen((char *)wifi_settings.ap_ssid);
+	/* Need space for "_" + 4 hex chars + null terminator = 6 bytes */
+	if ((current_len + 6 < sizeof(wifi_settings.ap_ssid)) && (esp_read_mac(mac_address, ESP_MAC_WIFI_STA) == ESP_OK))
 	{
 		char buf[6];
-		sprintf(buf, "_%02X%02X", (unsigned int)mac_address[4], (unsigned int)mac_address[5]);
-		strcat((char *)wifi_settings.ap_ssid, buf);
+		int written = snprintf(buf, sizeof(buf), "_%02X%02X", (unsigned int)mac_address[4], (unsigned int)mac_address[5]);
+		if (written > 0 && written < (int)sizeof(buf) && (current_len + written < sizeof(wifi_settings.ap_ssid)))
+		{
+			strncat((char *)wifi_settings.ap_ssid, buf, sizeof(wifi_settings.ap_ssid) - current_len - 1);
+		}
 	}
 }
 
@@ -312,14 +321,30 @@ void wifi_manager_timer_retry_cb(TimerHandle_t xTimer)
 		return;
 	}
 
-	ESP_LOGI(TAG, "Retry Timer Tick! Sending ORDER_CONNECT_STA with reason CONNECTION_REQUEST_AUTO_RECONNECT");
+	/* Check if a connection attempt is already in progress - if so, skip this retry */
+	EventBits_t uxBits = xEventGroupGetBits(wifi_manager_event_group);
+	if (uxBits & WIFI_MANAGER_CONNECT_IN_PROGRESS)
+	{
+		ESP_LOGI(TAG, "Connection already in progress, skipping retry timer callback");
+		return;
+	}
+
+	/* Check if user requested disconnect - if so, don't retry */
+	if (uxBits & WIFI_MANAGER_REQUEST_DISCONNECT_BIT)
+	{
+		ESP_LOGI(TAG, "User requested disconnect, stopping retry timer");
+		xTimerStop(xTimer, (TickType_t)0);
+		return;
+	}
+
+	ESP_LOGI(TAG, "Retry Timer Tick! Sending ORDER_LOAD_AND_RESTORE_STA for auto-reconnect");
 
 	decelerate_retry_timer();
 
 	/* stop the timer */
 	xTimerStop(xTimer, (TickType_t)0);
 
-	/* Attempt to reconnect */
+	/* Attempt to reconnect by loading and restoring saved config */
 	wifi_manager_send_message(WM_ORDER_LOAD_AND_RESTORE_STA, NULL);
 }
 
@@ -457,7 +482,8 @@ void wifi_manager_start()
 		 * have one */
 		wifi_manager_generate_ap_password();
 	}
-	strcpy((char *)wifi_settings.ap_pwd, wifi_manager_ap_password);
+	strncpy((char *)wifi_settings.ap_pwd, wifi_manager_ap_password, sizeof(wifi_settings.ap_pwd) - 1);
+	wifi_settings.ap_pwd[sizeof(wifi_settings.ap_pwd) - 1] = '\0';
 #endif // CONFIG_USE_RANDOM_AP_PASSWORD
 
 	ESP_LOGI(TAG, "AP password: %s", wifi_settings.ap_pwd);
@@ -588,15 +614,20 @@ esp_err_t wifi_manager_save_sta_config()
 	size_t required_size = 0;
 	int i;
 
-	// Lock mutex
-	xSemaphoreTake(wifi_manager_json_mutex, portMAX_DELAY);
+	// Lock NVS mutex for thread-safe NVS access
+	if (!nvs_sync_lock(portMAX_DELAY))
+	{
+		ESP_LOGE(TAG, "Failed to lock NVS mutex");
+		return ESP_FAIL;
+	}
 
 	// Open NVS
 	esp_err = nvs_open(wifi_manager_nvs_namespace, NVS_READWRITE, &handle);
 	if (esp_err != ESP_OK)
 	{
 		ESP_LOGE(TAG, "NVS open failed (%d)", esp_err);
-		goto exit;
+		nvs_sync_unlock();
+		return esp_err;
 	}
 
 	// Read saved networks from NVS
@@ -608,13 +639,17 @@ esp_err_t wifi_manager_save_sta_config()
 			if (required_size > sizeof(saved_networks))
 			{
 				ESP_LOGE(TAG, "Saved networks blob too large (%d)", required_size);
-				goto exit;
+				nvs_close(handle);
+				nvs_sync_unlock();
+				return ESP_ERR_INVALID_SIZE;
 			}
 			esp_err = nvs_get_blob(handle, "saved_networks", saved_networks, &required_size);
 			if (esp_err != ESP_OK)
 			{
 				ESP_LOGE(TAG, "Failed to read saved networks from NVS (%d)", esp_err);
-				goto exit;
+				nvs_close(handle);
+				nvs_sync_unlock();
+				return esp_err;
 			}
 		}
 	}
@@ -626,7 +661,9 @@ esp_err_t wifi_manager_save_sta_config()
 	else
 	{
 		ESP_LOGE(TAG, "Failed to get saved networks blob size from NVS (%d)", esp_err);
-		goto exit;
+		nvs_close(handle);
+		nvs_sync_unlock();
+		return esp_err;
 	}
 
 	// Add current network to saved networks
@@ -639,7 +676,9 @@ esp_err_t wifi_manager_save_sta_config()
 			{
 				// Password unchanged, nothing to do
 				ESP_LOGI(TAG, "Network %s already saved", wifi_manager_config_sta->sta.ssid);
-				goto exit;
+				nvs_close(handle);
+				nvs_sync_unlock();
+				return ESP_OK;
 			}
 			ESP_LOGI(TAG, "Updating password for network %s", wifi_manager_config_sta->sta.ssid);
 			memcpy(&saved_networks[i].ssid, &wifi_manager_config_sta->sta.ssid, sizeof(wifi_manager_config_sta->sta.ssid));
@@ -659,9 +698,9 @@ esp_err_t wifi_manager_save_sta_config()
 	{
 		// No empty slot found, overwrite first saved network delete the oldest network and shift the rest down one
 		ESP_LOGI(TAG, "No empty slot found, overwriting first saved network");
-		for (int i = 0; i < CONFIG_WIFI_MAX_AP_CONFIGS - 2; i++)
+		for (int j = 0; j < CONFIG_WIFI_MAX_AP_CONFIGS - 1; j++)
 		{
-			memcpy(&saved_networks[i], &saved_networks[i + 1], sizeof(saved_networks[i + 1]));
+			memcpy(&saved_networks[j], &saved_networks[j + 1], sizeof(ap_config_t));
 		}
 		memcpy(&saved_networks[CONFIG_WIFI_MAX_AP_CONFIGS - 1].ssid, &wifi_manager_config_sta->sta.ssid, sizeof(wifi_manager_config_sta->sta.ssid));
 		memcpy(&saved_networks[CONFIG_WIFI_MAX_AP_CONFIGS - 1].password, &wifi_manager_config_sta->sta.password, sizeof(wifi_manager_config_sta->sta.password));
@@ -672,36 +711,30 @@ esp_err_t wifi_manager_save_sta_config()
 	if (esp_err != ESP_OK)
 	{
 		ESP_LOGE(TAG, "Failed to save saved networks to NVS (%d)", esp_err);
-		goto exit;
+		nvs_close(handle);
+		nvs_sync_unlock();
+		return esp_err;
 	}
-	else if (esp_err == ESP_OK)
-	{
-		ESP_LOGI(TAG, "Saved networks to NVS");
-	}
+	ESP_LOGI(TAG, "Saved networks to NVS");
 
 	// Commit NVS
 	esp_err = nvs_commit(handle);
 	if (esp_err != ESP_OK)
 	{
 		ESP_LOGE(TAG, "NVS commit failed (%d)", esp_err);
-		goto exit;
+		nvs_close(handle);
+		nvs_sync_unlock();
+		return esp_err;
 	}
-	else if (esp_err == ESP_OK)
-	{
-		ESP_LOGI(TAG, "Commited NVS");
-	}
+	ESP_LOGI(TAG, "Committed NVS");
 
-	// Success
-	esp_err = ESP_OK;
-
-exit:
 	// Close NVS
 	nvs_close(handle);
 
-	// Unlock mutex
-	xSemaphoreGive(wifi_manager_json_mutex);
+	// Unlock NVS mutex
+	nvs_sync_unlock();
 
-	return esp_err;
+	return ESP_OK;
 }
 
 bool wifi_manager_wifi_sta_config_exists()
@@ -775,11 +808,12 @@ bool wifi_manager_fetch_wifi_sta_config()
 		bool found_saved_network = false;
 		for (int i = 0; i < ap_count; i++)
 		{
-			ESP_LOGI(TAG, "SSID: %s", ap_list[i].ssid);
+			ESP_LOGD(TAG, "Checking SSID: %s", ap_list[i].ssid);
 
 			if (wifi_manager_saved_wifi_scan(&ap_list[i]))
 			{
 				found_saved_network = true;
+				ESP_LOGI(TAG, "Found saved network: %s", ap_list[i].ssid);
 				break;
 			}
 		}
@@ -801,7 +835,11 @@ bool wifi_manager_fetch_wifi_sta_config()
 
 void wifi_manager_clear_ip_info_json()
 {
-	strcpy(ip_info_json, "{}\n");
+	if (ip_info_json != NULL)
+	{
+		strncpy(ip_info_json, "{}\n", JSON_IP_INFO_SIZE - 1);
+		ip_info_json[JSON_IP_INFO_SIZE - 1] = '\0';
+	}
 }
 
 void wifi_manager_generate_ip_info_json(update_reason_code_t update_reason_code)
@@ -866,7 +904,12 @@ void wifi_manager_generate_ip_info_json(update_reason_code_t update_reason_code)
 
 void wifi_manager_clear_access_points_json()
 {
-	strcpy(accessp_json, "[]\n");
+	if (accessp_json != NULL)
+	{
+		size_t max_size = (MAX_AP_NUM * JSON_ONE_APP_SIZE + 4);
+		strncpy(accessp_json, "[]\n", max_size - 1);
+		accessp_json[max_size - 1] = '\0';
+	}
 }
 void wifi_manager_generate_access_points_json()
 {
@@ -883,10 +926,22 @@ void wifi_manager_generate_access_points_json()
 	}
 
 	char *json_string = cJSON_PrintUnformatted(wifi_scan_json);
-	strcpy(accessp_json, json_string);
+	if (json_string != NULL && accessp_json != NULL)
+	{
+		size_t max_size = (MAX_AP_NUM * JSON_ONE_APP_SIZE + 4);
+		strncpy(accessp_json, json_string, max_size - 1);
+		accessp_json[max_size - 1] = '\0';
+		ESP_LOGI(TAG, "wifi_manager_generate_access_points_json: %s", accessp_json);
+	}
+	else
+	{
+		ESP_LOGE(TAG, "Failed to generate access points JSON");
+	}
 	cJSON_Delete(wifi_scan_json);
-	free(json_string);
-	ESP_LOGI(TAG, "wifi_manager_generate_access_points_json: %s", accessp_json);
+	if (json_string != NULL)
+	{
+		free(json_string);
+	}
 }
 
 bool wifi_manager_lock_sta_ip_string(TickType_t xTicksToWait)
@@ -924,7 +979,11 @@ void wifi_manager_safe_update_sta_ip_string(uint32_t ip)
 		char str_ip[IP4ADDR_STRLEN_MAX];
 		esp_ip4addr_ntoa(&ip4, str_ip, IP4ADDR_STRLEN_MAX);
 
-		strcpy(wifi_manager_sta_ip, str_ip);
+		if (wifi_manager_sta_ip != NULL)
+		{
+			strncpy(wifi_manager_sta_ip, str_ip, IP4ADDR_STRLEN_MAX - 1);
+			wifi_manager_sta_ip[IP4ADDR_STRLEN_MAX - 1] = '\0';
+		}
 
 		ESP_LOGD(TAG, "Set STA IP String to: %s", wifi_manager_sta_ip);
 
@@ -1365,16 +1424,26 @@ void possibly_do_hardcoded_connect()
 {
 
 	// Only check once every HARDCODED_CHECK_INTERVAL milliseconds
-	if ((xTaskGetTickCount() - last_hardcoded_connect_check) < pdMS_TO_TICKS(HARDCODED_CHECK_INTERVAL))
+	TickType_t current_tick = xTaskGetTickCount();
+	TickType_t tick_diff = (current_tick >= last_hardcoded_connect_check) ? 
+		(current_tick - last_hardcoded_connect_check) : 
+		(UINT32_MAX - last_hardcoded_connect_check + current_tick + 1);
+	if (tick_diff < pdMS_TO_TICKS(HARDCODED_CHECK_INTERVAL))
 	{
 		return;
 	}
-	last_hardcoded_connect_check = xTaskGetTickCount();
+	last_hardcoded_connect_check = current_tick;
 
 	// HARDCODED_CONNECT_DELAY milliseconds must have elapsed since startup
-	if (!hardcoded_connect_delay_elapsed && ((xTaskGetTickCount() - wifi_started_timestamp) < pdMS_TO_TICKS(HARDCODED_CONNECT_DELAY)))
+	if (!hardcoded_connect_delay_elapsed)
 	{
-		return;
+		TickType_t startup_diff = (current_tick >= wifi_started_timestamp) ? 
+			(current_tick - wifi_started_timestamp) : 
+			(UINT32_MAX - wifi_started_timestamp + current_tick + 1);
+		if (startup_diff < pdMS_TO_TICKS(HARDCODED_CONNECT_DELAY))
+		{
+			return;
+		}
 	}
 	// Set hardcoded_connect_delay_elapsed flag so that the tick
 	// calculation just above doesn't need to be done anymore - this avoids
@@ -1515,9 +1584,8 @@ void wifi_manager(void *pvParameters)
 				ESP_LOGE("NVS", "Failed to write wifiPower to NVS");
 			}
 		}
+		nvs_close(device_settings_handle);
 	}
-
-	nvs_close(device_settings_handle);
 
 	esp_wifi_set_max_tx_power(wifiPower);
 #endif // CONFIG_WIFI_POWER_ADJUSTABLE
@@ -1622,6 +1690,18 @@ void wifi_manager(void *pvParameters)
 			case WM_ORDER_LOAD_AND_RESTORE_STA:
 			{
 				ESP_LOGI(TAG, "MESSAGE: ORDER_LOAD_AND_RESTORE_STA");
+				
+				/* Check if user requested disconnect - if so, don't try to restore */
+				uxBits = xEventGroupGetBits(wifi_manager_event_group);
+				if (uxBits & WIFI_MANAGER_REQUEST_DISCONNECT_BIT)
+				{
+					ESP_LOGI(TAG, "User requested disconnect, skipping restore");
+					/* callback */
+					if (cb_ptr_arr[msg.code])
+						(*cb_ptr_arr[msg.code])(NULL);
+					break;
+				}
+				
 				if (wifi_manager_fetch_wifi_sta_config())
 				{
 					ESP_LOGI(TAG, "Saved wifi found. Will attempt to connect.");
@@ -1629,7 +1709,11 @@ void wifi_manager(void *pvParameters)
 				}
 				else
 				{
-					xTimerStart(wifi_manager_retry_timer, (TickType_t)0);
+					/* Only start retry timer if not already connected and user didn't request disconnect */
+					if (!(uxBits & WIFI_MANAGER_WIFI_CONNECTED_BIT))
+					{
+						xTimerStart(wifi_manager_retry_timer, (TickType_t)0);
+					}
 #ifdef CONFIG_WIFI_MANAGER_AUTOSTART_AP
 					/* no wifi saved: start soft AP! This is what should happen during a first run */
 					ESP_LOGI(TAG, "No saved wifi found. Starting access point.");
@@ -1655,6 +1739,13 @@ void wifi_manager(void *pvParameters)
 				if (((BaseType_t)msg.param == CONNECTION_REQUEST_USER) || ((BaseType_t)msg.param == CONNECTION_REQUEST_USER_NO_SAVE))
 				{
 					xEventGroupSetBits(wifi_manager_event_group, WIFI_MANAGER_REQUEST_STA_CONNECT_BIT);
+					
+					/* Stop retry timer when user initiates a new connection */
+					if (wifi_manager_retry_timer != NULL)
+					{
+						xTimerStop(wifi_manager_retry_timer, (TickType_t)0);
+					}
+					
 					if ((BaseType_t)msg.param == CONNECTION_REQUEST_USER)
 					{
 						/* Ensure WIFI_MANAGER_DONT_SAVE_CONNECTION_INFO_BIT is cleared so that configuration is
@@ -1745,6 +1836,16 @@ void wifi_manager(void *pvParameters)
 				;
 				wifi_event_sta_disconnected_t *wifi_event_sta_disconnected = (wifi_event_sta_disconnected_t *)msg.param;
 				ESP_LOGW(TAG, "MESSAGE: EVENT_STA_DISCONNECTED with Reason code: %d at BSSID: " MACSTR, wifi_event_sta_disconnected->reason, MAC2STR(wifi_event_sta_disconnected->bssid));
+				
+				/* Special handling for NO_AP_FOUND (201) - stop retrying as it's blocking */
+				if (wifi_event_sta_disconnected->reason == 201)
+				{
+					ESP_LOGW(TAG, "NO_AP_FOUND (201) - stopping retry timer to avoid blocking");
+					if (wifi_manager_retry_timer != NULL)
+					{
+						xTimerStop(wifi_manager_retry_timer, (TickType_t)0);
+					}
+				}
 
 				/* this even can be posted in numerous different conditions
 				 *
@@ -1818,11 +1919,17 @@ void wifi_manager(void *pvParameters)
 				{
 					ESP_LOGI(TAG, "Doing deferred connect");
 					xEventGroupClearBits(wifi_manager_event_group, WIFI_MANAGER_REQUEST_DEFERRED_CONNECT);
-					/* Copy saved SSID/password and into the STA config. */
+					
 					wifi_config_t *config = wifi_manager_get_wifi_sta_config();
 					initialize_wifi_manager_config_sta(config);
-					memcpy(config->sta.ssid, connect_request_ssid, MAX_SSID_SIZE);
-					memcpy(config->sta.password, connect_request_password, MAX_PASSWORD_SIZE);
+					
+					/* If this is a user-requested connection, use the saved request credentials */
+					if (uxBits & WIFI_MANAGER_REQUEST_STA_CONNECT_BIT)
+					{
+						memcpy(config->sta.ssid, connect_request_ssid, MAX_SSID_SIZE);
+						memcpy(config->sta.password, connect_request_password, MAX_PASSWORD_SIZE);
+					}
+					/* Otherwise, for auto-reconnect, the config should already be set from the saved networks */
 					/* esp_wifi_set_config() must be called before doing the deferred connect, otherwise
 					 * if the previous (failed) connection attempt was to the same AP, then the
 					 * deferred connect will fail with reason 205 (WIFI_REASON_CONNECTION_FAIL) due
@@ -1836,6 +1943,12 @@ void wifi_manager(void *pvParameters)
 					/* there are no retries when it's a user requested connection by design. This avoids a user hanging too much
 					 * in case they typed a wrong password for instance. Here we simply clear the request bit and move on */
 					xEventGroupClearBits(wifi_manager_event_group, WIFI_MANAGER_REQUEST_STA_CONNECT_BIT);
+					
+					/* Stop retry timer since user connection failed - don't auto-retry user-initiated connections */
+					if (wifi_manager_retry_timer != NULL)
+					{
+						xTimerStop(wifi_manager_retry_timer, (TickType_t)0);
+					}
 
 					if (wifi_manager_lock_json_buffer(portMAX_DELAY))
 					{
@@ -1847,6 +1960,12 @@ void wifi_manager(void *pvParameters)
 				{
 					/* user manually requested a disconnect so the lost connection is a normal event. Clear the flag and restart the AP */
 					xEventGroupClearBits(wifi_manager_event_group, WIFI_MANAGER_REQUEST_DISCONNECT_BIT);
+
+					/* Stop retry timer since user manually disconnected */
+					if (wifi_manager_retry_timer != NULL)
+					{
+						xTimerStop(wifi_manager_retry_timer, (TickType_t)0);
+					}
 
 					/* erase configuration */
 					wifi_manager_erase_sta_config();
@@ -2002,7 +2121,7 @@ void wifi_manager(void *pvParameters)
 				}
 				else
 				{
-					abort();
+					ESP_LOGE(TAG, "Failed to lock JSON buffer mutex when updating IP info");
 				}
 
 				/* start the timer that will eventually shutdown the access point
@@ -2042,6 +2161,12 @@ void wifi_manager(void *pvParameters)
 
 				/* precise this is coming from a user request */
 				xEventGroupSetBits(wifi_manager_event_group, WIFI_MANAGER_REQUEST_DISCONNECT_BIT);
+
+				/* Stop retry timer since user is manually disconnecting */
+				if (wifi_manager_retry_timer != NULL)
+				{
+					xTimerStop(wifi_manager_retry_timer, (TickType_t)0);
+				}
 
 				/* order wifi disconnect */
 				ESP_ERROR_CHECK(esp_wifi_disconnect());

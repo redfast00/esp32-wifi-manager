@@ -225,9 +225,17 @@ static esp_err_t http_server_get_handler(httpd_req_t *req){
     }
 
 	/* determine if Host is from the STA IP address */
-	wifi_manager_lock_sta_ip_string(portMAX_DELAY);
-	bool access_from_sta_ip = host != NULL?strstr(host, wifi_manager_get_sta_ip_string()):false;
-	wifi_manager_unlock_sta_ip_string();
+	bool access_from_sta_ip = false;
+	if (host != NULL)
+	{
+		wifi_manager_lock_sta_ip_string(portMAX_DELAY);
+		const char *sta_ip = wifi_manager_get_sta_ip_string();
+		if (sta_ip != NULL)
+		{
+			access_from_sta_ip = (strstr(host, sta_ip) != NULL);
+		}
+		wifi_manager_unlock_sta_ip_string();
+	}
 
 
 	if (host != NULL && !strstr(host, DEFAULT_AP_IP) && !access_from_sta_ip) {
@@ -404,9 +412,12 @@ static char* http_app_generate_url(const char* page){
 	const size_t url_sz = sizeof(char) * ( (root_len+1) + ( strlen(page) + 1) );
 
 	ret = malloc(url_sz);
-	memset(ret, 0x00, url_sz);
-	strcpy(ret, WEBAPP_LOCATION);
-	ret = strcat(ret, page);
+	if (ret != NULL)
+	{
+		memset(ret, 0x00, url_sz);
+		strncpy(ret, WEBAPP_LOCATION, url_sz - 1);
+		strncat(ret, page, url_sz - strlen(ret) - 1);
+	}
 
 	return ret;
 }
@@ -439,8 +450,12 @@ void http_app_start(bool lru_purge_enable){
 			/* root url, eg "/"   */
 			const size_t http_root_url_sz = sizeof(char) * (root_len+1);
 			http_root_url = malloc(http_root_url_sz);
-			memset(http_root_url, 0x00, http_root_url_sz);
-			strcpy(http_root_url, WEBAPP_LOCATION);
+			if (http_root_url != NULL)
+			{
+				memset(http_root_url, 0x00, http_root_url_sz);
+				strncpy(http_root_url, WEBAPP_LOCATION, http_root_url_sz - 1);
+				http_root_url[http_root_url_sz - 1] = '\0';
+			}
 
 			/* redirect url */
 			size_t redirect_sz = 22 + root_len + 1; /* strlen(http://255.255.255.255) + strlen("/") + 1 for \0 */

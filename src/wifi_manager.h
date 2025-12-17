@@ -360,7 +360,7 @@ extern "C"
 	/**
 	 * @brief requests a wifi scan
 	 */
-	void wifi_manager_scan_awifi_manager_send_messagesync();
+	void wifi_manager_scan_async();
 
 	/**
 	 * @brief requests to disconnect and forget about the access point.
