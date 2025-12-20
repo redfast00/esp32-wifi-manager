@@ -207,8 +207,6 @@ static void wifi_manager_event_handler(void *arg, esp_event_base_t event_base,
 
 void reset_retry_timer(void) {
   current_retry_interval = CONFIG_WIFI_MANAGER_INITIAL_RETRY_MS;
-  xTimerChangePeriod(wifi_manager_retry_timer,
-                     pdMS_TO_TICKS(current_retry_interval), 0);
   ESP_LOGW(TAG, "resetting retry timer to %ld ms", current_retry_interval);
   xTimerStop(wifi_manager_retry_timer, (TickType_t)0);
 }
@@ -225,8 +223,21 @@ void decelerate_retry_timer(void) {
 
     ESP_LOGW(TAG, "Next retry interval set to %ld ms", current_retry_interval);
   }
-  xTimerChangePeriod(wifi_manager_retry_timer,
-                     pdMS_TO_TICKS(current_retry_interval), 0);
+}
+
+/**
+ * @brief Helper function to safely start the retry timer with the current period
+ * 
+ * This function updates the timer period and starts it. It should only be called
+ * from the WiFi manager task context, not from timer callbacks.
+ */
+static void wifi_manager_start_retry_timer(void) {
+  if (wifi_manager_retry_timer != NULL) {
+    /* Update timer period with current retry interval before starting */
+    xTimerChangePeriod(wifi_manager_retry_timer,
+                       pdMS_TO_TICKS(current_retry_interval), 0);
+    xTimerStart(wifi_manager_retry_timer, (TickType_t)0);
+  }
 }
 
 int compare_rssi(const void *a, const void *b) {
@@ -316,6 +327,13 @@ void wifi_manager_timer_retry_cb(TimerHandle_t xTimer) {
     return;
   }
 
+  /* Check if saved networks exist - if not, stop timer and don't retry */
+  if (!wifi_manager_wifi_sta_config_exists()) {
+    ESP_LOGI(TAG, "No saved networks exist, stopping retry timer");
+    xTimerStop(xTimer, (TickType_t)0);
+    return;
+  }
+
   /* Check if a connection attempt is already in progress - if so, skip this
    * retry */
   EventBits_t uxBits = xEventGroupGetBits(wifi_manager_event_group);
@@ -393,7 +411,15 @@ static void wifi_manager_generate_ap_password(void) {
 
 void wifi_manager_init() {
   /* initialize flash memory */
-  nvs_flash_init();
+  esp_err_t ret = nvs_flash_init();
+  if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+      ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    // NVS partition was truncated or has a new version, erase it and reinitialize
+    ESP_LOGW(TAG, "NVS partition needs to be erased and reinitialized");
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    ret = nvs_flash_init();
+  }
+  ESP_ERROR_CHECK(ret);
   ESP_ERROR_CHECK(nvs_sync_create()); /* semaphore for thread synchronization on
                                          NVS memory */
 
@@ -567,30 +593,41 @@ bool wifi_manager_saved_wifi_scan(wifi_ap_record_t *ap) {
       sz = sizeof(saved_networks);
       esp_err = nvs_get_blob(handle, "saved_networks", saved_networks, &sz);
 
-      if (esp_err != ESP_OK) {
-        ESP_LOGE(TAG, "Error reading saved networks from NVS: %s",
-                 esp_err_to_name(esp_err));
-        return false;
-      }
-
-      for (int i = 0; i < CONFIG_WIFI_MAX_AP_CONFIGS; i++) {
-        if (saved_networks[i].ssid[0] != 0) {
-          if (strncmp((char *)ap->ssid, (char *)saved_networks[i].ssid,
-                      MAX_SSID_SIZE) == 0) {
-            exists = true;
-            memcpy(&wifi_manager_config_sta->sta.ssid, saved_networks[i].ssid,
-                   MAX_SSID_SIZE);
-            memcpy(&wifi_manager_config_sta->sta.password,
-                   saved_networks[i].password, MAX_PASSWORD_SIZE);
-            break;
+      if (esp_err == ESP_OK) {
+        // Successfully read saved networks, check if this AP matches
+        for (int i = 0; i < CONFIG_WIFI_MAX_AP_CONFIGS; i++) {
+          if (saved_networks[i].ssid[0] != 0) {
+            if (strncmp((char *)ap->ssid, (char *)saved_networks[i].ssid,
+                        MAX_SSID_SIZE) == 0) {
+              exists = true;
+              memcpy(&wifi_manager_config_sta->sta.ssid, saved_networks[i].ssid,
+                     MAX_SSID_SIZE);
+              memcpy(&wifi_manager_config_sta->sta.password,
+                     saved_networks[i].password, MAX_PASSWORD_SIZE);
+              break;
+            }
           }
         }
+      } else if (esp_err == ESP_ERR_NVS_NOT_FOUND) {
+        // NVS is blank - no saved networks, this is normal on first boot
+        // Just return false, no error logging needed
+        ESP_LOGD(TAG, "No saved networks in NVS (first boot or NVS cleared)");
+      } else {
+        // Actual error reading from NVS (not just "not found")
+        ESP_LOGE(TAG, "Error reading saved networks from NVS: %s",
+                 esp_err_to_name(esp_err));
       }
 
       nvs_close(handle);
+    } else {
+      // Failed to open NVS namespace
+      ESP_LOGE(TAG, "Failed to open NVS namespace: %s",
+               esp_err_to_name(esp_err));
     }
 
     nvs_sync_unlock();
+  } else {
+    ESP_LOGE(TAG, "Failed to acquire NVS sync lock");
   }
 
   return exists;
@@ -1648,10 +1685,15 @@ void wifi_manager(void *pvParameters) {
               WM_ORDER_CONNECT_STA,
               (void *)CONNECTION_REQUEST_RESTORE_CONNECTION);
         } else {
-          /* Only start retry timer if not already connected and user didn't
-           * request disconnect */
-          if (!(uxBits & WIFI_MANAGER_WIFI_CONNECTED_BIT)) {
-            xTimerStart(wifi_manager_retry_timer, (TickType_t)0);
+          /* No saved networks found - check if any exist before starting retry timer */
+          if (wifi_manager_wifi_sta_config_exists()) {
+            /* Saved networks exist but not currently in range - start retry timer */
+            if (!(uxBits & WIFI_MANAGER_WIFI_CONNECTED_BIT)) {
+              wifi_manager_start_retry_timer();
+            }
+          } else {
+            /* No saved networks exist at all - no point in retrying */
+            ESP_LOGI(TAG, "No saved networks exist, skipping retry timer");
           }
 #ifdef CONFIG_WIFI_MANAGER_AUTOSTART_AP
           /* no wifi saved: start soft AP! This is what should happen during a
@@ -1938,8 +1980,8 @@ void wifi_manager(void *pvParameters) {
             wifi_manager_unlock_json_buffer();
           }
 
-          /* Start the timer that will try to restore the saved config */
-          xTimerStart(wifi_manager_retry_timer, (TickType_t)0);
+        /* Start the timer that will try to restore the saved config */
+        wifi_manager_start_retry_timer();
 
           /* if it was a restore attempt connection, we clear the bit */
           xEventGroupClearBits(wifi_manager_event_group,
