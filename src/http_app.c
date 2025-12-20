@@ -157,16 +157,22 @@ static esp_err_t http_server_post_handler(httpd_req_t *req){
 		ssid_len = httpd_req_get_hdr_value_len(req, "X-Custom-ssid");
 		password_len = httpd_req_get_hdr_value_len(req, "X-Custom-pwd");
 
-
-		if(ssid_len && ssid_len <= MAX_SSID_SIZE && password_len && password_len <= MAX_PASSWORD_SIZE){
+		/* SSID is required, password is optional (for open networks) */
+		if(ssid_len && ssid_len <= MAX_SSID_SIZE && password_len <= MAX_PASSWORD_SIZE){
 
 			/* get the actual value of the headers */
 			ssid = malloc(sizeof(char) * (ssid_len + 1));
-			password = malloc(sizeof(char) * (password_len + 1));
 			httpd_req_get_hdr_value_str(req, "X-Custom-ssid", ssid, ssid_len+1);
-			httpd_req_get_hdr_value_str(req, "X-Custom-pwd", password, password_len+1);
+			
+			/* Allocate password buffer even if empty (for open networks) */
+			password = malloc(sizeof(char) * (password_len + 1));
+			if(password_len > 0) {
+				httpd_req_get_hdr_value_str(req, "X-Custom-pwd", password, password_len+1);
+			} else {
+				password[0] = '\0';  /* Empty password for open networks */
+			}
 
-			ESP_LOGI(TAG, "ssid: %s, password: %s", ssid, password);
+			ESP_LOGI(TAG, "ssid: %s, password: %s (len: %d)", ssid, password_len > 0 ? password : "(empty)", password_len);
 			ESP_LOGD(TAG, "http_server_post_handler: wifi_manager_connect_async() call");
 			wifi_manager_connect_async(true, ssid, password);
 
@@ -183,6 +189,7 @@ static esp_err_t http_server_post_handler(httpd_req_t *req){
 		}
 		else{
 			/* bad request the authentification header is not complete/not the correct format */
+			ESP_LOGE(TAG, "Invalid request: ssid_len=%d, password_len=%d", ssid_len, password_len);
 			httpd_resp_set_status(req, http_400_hdr);
 			httpd_resp_send(req, NULL, 0);
 		}

@@ -21,6 +21,7 @@ function docReady(fn) {
 }
 
 var selectedSSID = "";
+var selectedAuthmode = null;
 var refreshAPInterval = null;
 var checkStatusInterval = null;
 
@@ -75,17 +76,59 @@ docReady(async function () {
   gel("wifi-list").addEventListener(
     "click",
     (e) => {
-      selectedSSID = e.target.innerText;
-      gel("ssid-pwd").textContent = selectedSSID;
-      connect_div.style.display = "block";
-      wifi_div.style.display = "none";
-      // init_cancel();
+      // Find the parent element with data attributes
+      let target = e.target;
+      while (target && !target.hasAttribute("data-ssid")) {
+        target = target.parentElement;
+      }
+
+      if (target && target.hasAttribute("data-ssid")) {
+        selectedSSID = target.getAttribute("data-ssid");
+        selectedAuthmode = parseInt(target.getAttribute("data-authmode")) || 0;
+
+        // Show connect dialog for all networks
+        gel("ssid-pwd").textContent = selectedSSID;
+
+        // For open networks, hide password input and show password button
+        if (selectedAuthmode === 0) {
+          // Open network - hide password field and toggle button
+          gel("pwd").style.display = "none";
+          gel("togglepwd").style.display = "none";
+          // Update header text for open networks
+          document.querySelector("#connect header h1").textContent =
+            "Connect to Network";
+          document.querySelector(
+            "#connect h2"
+          ).textContent = `Connect to ${selectedSSID}`;
+        } else {
+          // Password-protected network - show password field and toggle button
+          gel("pwd").style.display = "block";
+          gel("togglepwd").style.display = "block";
+          // Reset header text for password-protected networks
+          document.querySelector("#connect header h1").textContent =
+            "Enter Password";
+          document.querySelector(
+            "#connect h2"
+          ).textContent = `Password for ${selectedSSID}`;
+          // Clear password field
+          gel("pwd").value = "";
+        }
+
+        connect_div.style.display = "block";
+        wifi_div.style.display = "none";
+      }
     },
     false
   );
 
   function cancel() {
     selectedSSID = "";
+    selectedAuthmode = null;
+    // Reset password field visibility
+    gel("pwd").style.display = "block";
+    gel("togglepwd").style.display = "block";
+    // Reset header text
+    document.querySelector("#connect header h1").textContent = "Enter Password";
     connect_div.style.display = "none";
     connect_manual_div.style.display = "none";
     wifi_div.style.display = "block";
@@ -220,13 +263,19 @@ async function performConnect(conntype) {
   //stop refreshing wifi list
   stopRefreshAPInterval();
 
-  var pwd;
+  var pwd = "";
   if (conntype == "manual") {
     //Grab the manual SSID and PWD
     selectedSSID = gel("manual_ssid").value;
     pwd = gel("manual_pwd").value;
   } else {
-    pwd = gel("pwd").value;
+    // For open networks (authmode == 0), use empty password
+    // For password-protected networks, get password from input field
+    if (selectedAuthmode === 0) {
+      pwd = ""; // Open network, no password needed
+    } else {
+      pwd = gel("pwd").value;
+    }
   }
   //reset connection
   gel("loading").style.display = "block";
@@ -289,8 +338,18 @@ function refreshAPHTML(data) {
   data.forEach(function (e, idx, array) {
     let ap_class = idx === array.length - 1 ? "" : " brdb";
     let rssicon = rssiToIcon(e.rssi);
-    let auth = e.auth == 0 ? "" : "pw";
-    h += `<div class="ape${ap_class}"><div class="${rssicon}"><div class="${auth}">${e.ssid}</div></div></div>\n`;
+    // Check authmode - 0 means open network (no password)
+    // Use authmode if available, otherwise fall back to auth
+    let authmode =
+      e.authmode !== undefined
+        ? e.authmode
+        : e.auth !== undefined
+        ? e.auth
+        : -1;
+    let isOpen = authmode === 0;
+    let auth = isOpen ? "" : "pw";
+    // Store authmode in data attribute for click handler
+    h += `<div class="ape${ap_class}" data-authmode="${authmode}" data-ssid="${e.ssid}"><div class="${rssicon}"><div class="${auth}">${e.ssid}</div></div></div>\n`;
   });
 
   gel("wifi-list").innerHTML = h;
@@ -306,9 +365,23 @@ async function checkStatus(url = "status.json") {
         switch (data["urc"]) {
           case 0:
             console.info("Got connection!");
-            document.querySelector(
+            let connectedSpan = document.querySelector(
               "#connected-to div div div span"
-            ).textContent = data["ssid"];
+            );
+            let connectedDiv = document.querySelector(
+              "#connected-to div div div"
+            );
+            if (connectedSpan) {
+              connectedSpan.textContent = data["ssid"];
+            }
+            // Update lock icon based on authmode (remove pw class if open network)
+            if (connectedDiv) {
+              if (selectedAuthmode === 0) {
+                connectedDiv.classList.remove("pw");
+              } else {
+                connectedDiv.classList.add("pw");
+              }
+            }
             document.querySelector("#connect-details h1").textContent =
               data["ssid"];
             gel("ip").textContent = data["ip"];
@@ -354,8 +427,17 @@ async function checkStatus(url = "status.json") {
           gel("wifi-status").style.display == "" ||
           gel("wifi-status").style.display == "none"
         ) {
-          document.querySelector("#connected-to div div div span").textContent =
-            data["ssid"];
+          let connectedSpan = document.querySelector(
+            "#connected-to div div div span"
+          );
+          let connectedDiv = document.querySelector(
+            "#connected-to div div div"
+          );
+          if (connectedSpan) {
+            connectedSpan.textContent = data["ssid"];
+          }
+          // For pre-existing connections, we don't know the authmode, so keep default (pw class)
+          // This is a limitation - we'd need authmode in status.json to fix this properly
           document.querySelector("#connect-details h1").textContent =
             data["ssid"];
           gel("ip").textContent = data["ip"];
